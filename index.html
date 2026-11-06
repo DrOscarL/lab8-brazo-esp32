@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manipulador 3-GDL teleoperado desde ESP32 (Velxio)</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #171e26; --line: #2a3441; --text: #dbe2ea;
+    --muted: #8a97a6; --accent: #3fb68b; --warn: #e0a43a; --err: #e05a5a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .app { display: grid; grid-template-columns: 1fr 340px; height: 100vh; }
+  #view { position: relative; min-height: 300px; }
+  #view canvas { display: block; }
+  .badge { position: absolute; top: 12px; left: 12px; padding: 6px 10px; border-radius: 6px;
+    background: rgba(23,30,38,.85); border: 1px solid var(--line); font-size: 12px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px;
+    background: var(--err); vertical-align: middle; }
+  .dot.on { background: var(--accent); } .dot.wait { background: var(--warn); }
+  aside { background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; padding: 16px; }
+  h1 { font-size: 15px; margin: 0 0 4px; } h2 { font-size: 12px; text-transform: uppercase;
+    letter-spacing: .06em; color: var(--muted); margin: 18px 0 8px; }
+  .sub { color: var(--muted); font-size: 12px; margin: 0; }
+  label { display: block; color: var(--muted); font-size: 12px; margin: 6px 0 2px; }
+  input[type=text] { width: 100%; padding: 7px 8px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+  input[type=range] { width: 100%; }
+  button { padding: 7px 12px; border-radius: 6px; border: 1px solid var(--line); background: #22303d;
+    color: var(--text); font: inherit; cursor: pointer; } button:hover { border-color: var(--accent); }
+  .row { display: flex; gap: 8px; align-items: center; } .row > input { flex: 1; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  td { padding: 3px 0; border-bottom: 1px solid var(--line); } td:first-child { color: var(--muted); }
+  td:last-child { text-align: right; font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+  code { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: #9fd3bf; word-break: break-all; }
+  .note { color: var(--muted); font-size: 12px; }
+  @media (max-width: 800px) { .app { grid-template-columns: 1fr; grid-template-rows: 55vh auto; height: auto; } }
+</style>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div class="app">
+  <div id="view">
+    <div class="badge"><span id="dot" class="dot"></span><span id="status">Desconectado</span></div>
+  </div>
+  <aside>
+    <h1>Manipulador 3-GDL · ESP32 en Velxio</h1>
+    <p class="sub">Laboratorio 8, Ejercicio 3 — Programación Aplicada en Microcontroladores</p>
+
+    <h2>Conexión</h2>
+    <label for="grupo">Identificador del grupo (debe coincidir con <code>GRUPO</code> del sketch)</label>
+    <div class="row">
+      <input id="grupo" type="text" value="grupo1">
+      <button id="btnConectar">Conectar</button>
+    </div>
+    <p class="note">Tópico: <code id="topicLbl"></code></p>
+
+    <h2>Estado recibido del ESP32</h2>
+    <table>
+      <tr><td>q₁ base [°]</td><td id="q1">—</td></tr>
+      <tr><td>q₂ hombro [°]</td><td id="q2">—</td></tr>
+      <tr><td>q₃ codo [°]</td><td id="q3">—</td></tr>
+      <tr><td>x [m] (ESP32)</td><td id="px">—</td></tr>
+      <tr><td>y [m] (ESP32)</td><td id="py">—</td></tr>
+      <tr><td>z [m] (ESP32)</td><td id="pz">—</td></tr>
+      <tr><td>‖p<sub>ESP32</sub> − p<sub>web</sub>‖ [m]</td><td id="err">—</td></tr>
+      <tr><td>Mensaje n (unsigned long long)</td><td id="n">—</td></tr>
+      <tr><td>t [µs] (long long)</td><td id="tus">—</td></tr>
+      <tr><td>Δt entre mensajes [ms]</td><td id="dt">—</td></tr>
+    </table>
+    <p class="note">p<sub>web</sub> se recalcula en JavaScript (double IEEE 754, igual que en el ESP32) a partir de los ángulos recibidos.
+      El contador y el tiempo se reciben como texto y se procesan con <code>BigInt</code>, porque <code>Number</code> solo es exacto hasta 2<sup>53</sup> − 1.</p>
+
+    <h2>Enviar mensaje al LCD</h2>
+    <div class="row">
+      <input id="cmd" type="text" maxlength="20" placeholder="máx. 20 caracteres">
+      <button id="btnCmd">Enviar</button>
+    </div>
+
+    <h2>Modo manual (sin ESP32)</h2>
+    <label>q₁ <span id="s1v">0</span>°</label><input id="s1" type="range" min="-90" max="90" value="0">
+    <label>q₂ <span id="s2v">45</span>°</label><input id="s2" type="range" min="0" max="180" value="45">
+    <label>q₃ <span id="s3v">-45</span>°</label><input id="s3" type="range" min="-135" max="135" value="-45">
+    <p class="note">Los deslizadores solo mueven el modelo local; al llegar datos del ESP32 éstos tienen prioridad.</p>
+  </aside>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ---------- Parámetros (deben coincidir con el sketch) ----------
+const L1 = 0.10, L2 = 0.12, L3 = 0.10;
+const BROKER = 'wss://broker.hivemq.com:8884/mqtt';
+const D2R = Math.PI / 180;
+
+// ---------- Escena (eje z hacia arriba, convención robótica) ----------
+const view = document.getElementById('view');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+view.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0f1419);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 10);
+camera.up.set(0, 0, 1);
+camera.position.set(0.45, -0.45, 0.35);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0.1);
+controls.update();
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 1.4);
+sun.position.set(0.5, -0.3, 1); scene.add(sun);
+
+const grid = new THREE.GridHelper(0.6, 12, 0x3a4756, 0x26303b);
+grid.rotation.x = Math.PI / 2; scene.add(grid);
+scene.add(new THREE.AxesHelper(0.08));
+
+const matBase = new THREE.MeshStandardMaterial({ color: 0x4b5563, metalness: .3, roughness: .6 });
+const matL2   = new THREE.MeshStandardMaterial({ color: 0x3fb68b, metalness: .2, roughness: .5 });
+const matL3   = new THREE.MeshStandardMaterial({ color: 0x4c8ed9, metalness: .2, roughness: .5 });
+const matJ    = new THREE.MeshStandardMaterial({ color: 0xdbe2ea, metalness: .4, roughness: .4 });
+
+// Eslabón cilíndrico a lo largo de +x, desde 0 hasta L
+function link(L, r, mat) {
+  const g = new THREE.CylinderGeometry(r, r, L, 24);
+  g.rotateZ(-Math.PI / 2); g.translate(L / 2, 0, 0);
+  return new THREE.Mesh(g, mat);
+}
+function joint(r) {
+  const g = new THREE.CylinderGeometry(r, r, r * 2.2, 24);   // eje de giro según y
+  return new THREE.Mesh(g, matJ);
+}
+
+// Cadena cinemática: base(q1, eje z) -> hombro(q2, eje y) -> codo(q3, eje y)
+const pedestal = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.05, 0.02, 32), matBase);
+pedestal.rotation.x = Math.PI / 2; pedestal.position.z = 0.01; scene.add(pedestal);
+
+const base = new THREE.Group(); scene.add(base);
+const col = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, L1, 24), matBase);
+col.rotation.x = Math.PI / 2; col.position.z = L1 / 2; base.add(col);
+
+const shoulder = new THREE.Group(); shoulder.position.z = L1; base.add(shoulder);
+shoulder.add(joint(0.022)); shoulder.add(link(L2, 0.012, matL2));
+
+const elbow = new THREE.Group(); elbow.position.x = L2; shoulder.add(elbow);
+elbow.add(joint(0.018)); elbow.add(link(L3, 0.010, matL3));
+
+const tool = new THREE.Mesh(new THREE.SphereGeometry(0.012, 20, 16),
+  new THREE.MeshStandardMaterial({ color: 0xe0a43a, emissive: 0x3a2200 }));
+tool.position.x = L3; elbow.add(tool);
+
+// Marcador de la posición informada por el ESP32 (debe coincidir con la punta)
+const espMark = new THREE.Mesh(new THREE.SphereGeometry(0.018, 16, 12),
+  new THREE.MeshBasicMaterial({ color: 0xe05a5a, wireframe: true }));
+espMark.visible = false; scene.add(espMark);
+
+// Trayectoria del efector
+const TRAIL = 400;
+const trailPos = new Float32Array(TRAIL * 3);
+const trailGeo = new THREE.BufferGeometry();
+trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPos, 3));
+trailGeo.setDrawRange(0, 0);
+scene.add(new THREE.Line(trailGeo, new THREE.LineBasicMaterial({ color: 0xe0a43a, transparent: true, opacity: .6 })));
+let trailN = 0;
+function pushTrail(p) {
+  if (trailN === TRAIL) { trailPos.copyWithin(0, 3); trailN--; }
+  trailPos.set(p, trailN * 3); trailN++;
+  trailGeo.setDrawRange(0, trailN); trailGeo.attributes.position.needsUpdate = true;
+}
+
+// ---------- Cinemática ----------
+function fk(q1, q2, q3) {
+  const t1 = q1 * D2R, t2 = q2 * D2R, t3 = q3 * D2R;
+  const r = L2 * Math.cos(t2) + L3 * Math.cos(t2 + t3);
+  return [r * Math.cos(t1), r * Math.sin(t1), L1 + L2 * Math.sin(t2) + L3 * Math.sin(t2 + t3)];
+}
+// Interpolación suave hacia el objetivo
+const qTarget = [0, 45, -45], qNow = [0, 45, -45];
+function applyPose(q) {
+  base.rotation.z = q[0] * D2R;
+  shoulder.rotation.y = -q[1] * D2R;   // q2 > 0 eleva el brazo
+  elbow.rotation.y = -q[2] * D2R;
+}
+
+// ---------- UI ----------
+const $ = id => document.getElementById(id);
+const sliders = ['s1', 's2', 's3'];
+sliders.forEach((id, i) => $(id).addEventListener('input', e => {
+  qTarget[i] = +e.target.value; $(id + 'v').textContent = e.target.value;
+}));
+
+function setStatus(text, cls) { $('status').textContent = text; $('dot').className = 'dot ' + (cls || ''); }
+
+// ---------- MQTT ----------
+let client = null, topicEstado = '', topicCmd = '', lastT = null, lastMsg = 0;
+const params = new URLSearchParams(location.search);
+if (params.get('g')) $('grupo').value = params.get('g');
+
+function updateTopicLabel() {
+  const g = $('grupo').value.trim() || 'grupo1';
+  topicEstado = `udla/lab8/${g}/brazo/estado`; topicCmd = `udla/lab8/${g}/brazo/cmd`;
+  $('topicLbl').textContent = topicEstado;
+}
+$('grupo').addEventListener('input', updateTopicLabel); updateTopicLabel();
+
+function conectar() {
+  if (client) { client.end(true); client = null; }
+  updateTopicLabel();
+  history.replaceState(null, '', '?g=' + encodeURIComponent($('grupo').value.trim()));
+  setStatus('Conectando al broker…', 'wait');
+  client = mqtt.connect(BROKER, { clientId: 'web-' + Math.random().toString(16).slice(2, 10), reconnectPeriod: 2000 });
+  client.on('connect', () => { client.subscribe(topicEstado); setStatus('Broker conectado · esperando ESP32', 'wait'); });
+  client.on('reconnect', () => setStatus('Reconectando…', 'wait'));
+  client.on('error', e => setStatus('Error: ' + e.message, ''));
+  client.on('message', (_t, buf) => {
+    let m; try { m = JSON.parse(buf.toString()); } catch { return; }
+    if (!Array.isArray(m.q) || m.q.length !== 3) return;
+    lastMsg = performance.now();
+    m.q.forEach((v, i) => { qTarget[i] = v; $(sliders[i]).value = v; $(sliders[i] + 'v').textContent = v.toFixed(0); });
+    $('q1').textContent = m.q[0].toFixed(2); $('q2').textContent = m.q[1].toFixed(2); $('q3').textContent = m.q[2].toFixed(2);
+    if (Array.isArray(m.p)) {
+      $('px').textContent = m.p[0].toFixed(6); $('py').textContent = m.p[1].toFixed(6); $('pz').textContent = m.p[2].toFixed(6);
+      const pw = fk(...m.q);
+      $('err').textContent = Math.hypot(m.p[0] - pw[0], m.p[1] - pw[1], m.p[2] - pw[2]).toExponential(2);
+      espMark.position.set(...m.p); espMark.visible = true;
+    }
+    if (m.n !== undefined) $('n').textContent = m.n;
+    if (m.t_us !== undefined) {
+      $('tus').textContent = m.t_us;
+      try {
+        const t = BigInt(m.t_us);
+        if (lastT !== null) $('dt').textContent = (Number(t - lastT) / 1000).toFixed(1);
+        lastT = t;
+      } catch {}
+    }
+  });
+}
+$('btnConectar').addEventListener('click', conectar);
+$('btnCmd').addEventListener('click', () => {
+  if (client && client.connected && $('cmd').value) client.publish(topicCmd, $('cmd').value.slice(0, 20));
+});
+setInterval(() => {
+  if (client && client.connected) {
+    const live = performance.now() - lastMsg < 2000;
+    setStatus(live ? 'Recibiendo datos del ESP32' : 'Broker conectado · esperando ESP32', live ? 'on' : 'wait');
+  }
+}, 500);
+conectar();
+
+// ---------- Bucle de render ----------
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize); resize();
+
+let frame = 0;
+renderer.setAnimationLoop(() => {
+  for (let i = 0; i < 3; i++) qNow[i] += (qTarget[i] - qNow[i]) * 0.2;
+  applyPose(qNow);
+  if (++frame % 3 === 0) pushTrail(fk(...qNow));
+  controls.update();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
